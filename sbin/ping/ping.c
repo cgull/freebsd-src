@@ -98,6 +98,7 @@
 					/* runs out of buffer space */
 #define	MAXIPLEN	(sizeof(struct ip) + MAX_IPOPTLEN)
 #define	MAXICMPLEN	(ICMP_ADVLENMIN + MAX_IPOPTLEN)
+#define	MAXPACKET	(65536 - 60 - 8)/* max packet size */
 #define	MAXWAIT		10000		/* max ms to wait for response */
 #define	MAXALARM	(60 * 60)	/* max seconds for alarm timeout */
 #define	MAXTOS		255
@@ -179,6 +180,8 @@ static long sntransmitted;	/* # of packets we sent in this sweep */
 static int sweepmax;		/* max value of payload in sweep */
 static int sweepmin = 0;	/* start value of payload in sweep */
 static int sweepincr = 1;	/* payload increment in sweep */
+static n_short receivedseq;	/* highest sequence # seen on inbound packet */
+static n_short window;		/* window size in packets for streaming ping */
 static int interval = 1000;	/* interval between packets, ms */
 static int waittime = MAXWAIT;	/* timeout for each packet */
 
@@ -261,7 +264,7 @@ ping(int argc, char *const *argv)
 		err(EX_OSERR, "srecv socket");
 	}
 
-	alarmtimeout = df = preload = tos = pcp = 0;
+	alarmtimeout = df = preload = tos = pcp = window = 0;
 
 	outpack = outpackhdr + sizeof(struct ip);
 	while ((ch = getopt(argc, argv, PING4OPTS)) != -1) {
@@ -419,6 +422,17 @@ ping(int argc, char *const *argv)
 			break;
 		case 'o':
 			options |= F_ONCE;
+			break;
+		case 'w':
+			ltmp = strtonum(optarg, 1, SHRT_MAX, &errstr);
+			if (errstr != NULL)
+				errx(EX_USAGE,
+				    "invalid window value: `%s'", optarg);
+                        window = (n_short)ltmp;
+			if (uid) {
+				errno = EPERM;
+				err(EX_NOPERM, "-w flag");
+			}
 			break;
 #ifdef IPSEC
 #ifdef IPSEC_POLICY_IPSEC
@@ -906,6 +920,16 @@ ping(int argc, char *const *argv)
 		(void)clock_gettime(CLOCK_MONOTONIC, &now);
 		timespecadd(&last, &intvl, &timeout);
 		timespecsub(&timeout, &now, &timeout);
+                /*
+                 * Don't wait to send if we've received any response
+                 * within our "window"
+                 */
+		if (!almost_done && window && 
+		    PING_SEQ_GEQ(receivedseq, (n_short)ntransmitted - window))
+		{
+			timeout.tv_nsec = 0;
+			timeout.tv_sec = 0;
+		}
 		if (timeout.tv_sec < 0)
 			timespecclear(&timeout);
 
@@ -1191,6 +1215,10 @@ pr_pack(char *buf, ssize_t cc, struct sockaddr_in *from, struct timespec *tv)
 			SET(seq % mx_dup_ck);
 			dupflag = 0;
 		}
+
+		if (window && PING_SEQ_LT(seq, ntransmitted) &&
+                    PING_SEQ_GT(seq, receivedseq))
+                        receivedseq = seq;
 
 		if (options & F_QUIET)
 			return;

@@ -31,6 +31,16 @@
 
 #include <sys/types.h>
 
+/*
+ * We send monotonically increasing ICMP sequence numbers.  We can
+ * operate on them with modular arithmetic for our windowing
+ * implementation.  These macros can be used to compare them.
+ */
+#define	PING_SEQ_LT(a,b)	((int16_t)((a)-(b)) < 0)
+#define	PING_SEQ_LEQ(a,b)	((int16_t)((a)-(b)) <= 0)
+#define	PING_SEQ_GT(a,b)	((int16_t)((a)-(b)) > 0)
+#define	PING_SEQ_GEQ(a,b)	((int16_t)((a)-(b)) >= 0)
+
 u_short in_cksum(u_char *, int);
 
 #endif
