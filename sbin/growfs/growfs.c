@@ -105,7 +105,7 @@ static union {
 
 static struct csum	*fscs;	/* cylinder summary */
 
-static void	growfs(int, int, unsigned int);
+static void	growfs(int, int, unsigned int, const fsid_t *);
 static void	rdfs(ufs2_daddr_t, size_t, void *, int);
 static void	wtfs(ufs2_daddr_t, size_t, void *, int, unsigned int);
 static int	charsperline(void);
@@ -120,6 +120,8 @@ static void	frag_adjust(ufs2_daddr_t, int);
 static void	updclst(int);
 static void	mount_reload(const struct statfs *stfs);
 static void	cgckhash(struct cg *);
+static void	ufssuspend(int fd, const fsid_t *fsid, const char *errmsg);
+static void	ufsresume(int fd, const fsid_t *fsid, const char *errmsg);
 
 /*
  * Here we actually start growing the file system. We basically read the
@@ -133,7 +135,7 @@ static void	cgckhash(struct cg *);
  * copies.
  */
 static void
-growfs(int fsi, int fso, unsigned int Nflag)
+growfs(int fsi, int fso, unsigned int Nflag, const fsid_t *suspfs)
 {
 	DBG_FUNC("growfs")
 	time_t modtime;
@@ -174,6 +176,42 @@ growfs(int fsi, int fso, unsigned int Nflag)
 	DBG_PRINT0("fscs read\n");
 
 	/*
+	 * Now build the cylinders group blocks and
+	 * then print out indices of cylinder groups.
+	 *
+	 * Since this does not write within the existing filesystem,
+	 * it could be done without suspending UFS.
+	 */
+	printf("super-block backups (for fsck_ffs -b #) at:\n");
+	i = 0;
+	width = charsperline();
+
+	/*
+	 * Iterate for only the new cylinder groups.
+	 */
+	for (cylno = osblock.fs_ncg; cylno < sblock.fs_ncg; cylno++) {
+		ufssuspend(fso, suspfs, "cg");
+		initcg(cylno, modtime, fso, Nflag);
+		ufsresume(fso, suspfs, "cg");
+		j = sprintf(tmpbuf, " %jd%s",
+		    (intmax_t)fsbtodb(&sblock, cgsblock(&sblock, cylno)),
+		    cylno < (sblock.fs_ncg - 1) ? "," : "" );
+		if (i + j >= width) {
+			printf("\n");
+			i = 0;
+		}
+		i += j;
+		printf("%s", tmpbuf);
+		fflush(stdout);
+	}
+	printf("\n");
+
+	/*
+	 * Suspend UFS writes before editing the existing filesystem's blocks.
+	 */
+	ufssuspend(fso, suspfs, "last cg");
+
+	/*
 	 * Do all needed changes in the former last cylinder group.
 	 */
 	updjcg(osblock.fs_ncg - 1, modtime, fsi, fso, Nflag);
@@ -194,32 +232,6 @@ growfs(int fsi, int fso, unsigned int Nflag)
 		printf("\twith soft updates\n");
 #undef B2MBFACTOR
 #endif /* FS_DEBUG */
-
-	/*
-	 * Now build the cylinders group blocks and
-	 * then print out indices of cylinder groups.
-	 */
-	printf("super-block backups (for fsck_ffs -b #) at:\n");
-	i = 0;
-	width = charsperline();
-
-	/*
-	 * Iterate for only the new cylinder groups.
-	 */
-	for (cylno = osblock.fs_ncg; cylno < sblock.fs_ncg; cylno++) {
-		initcg(cylno, modtime, fso, Nflag);
-		j = sprintf(tmpbuf, " %jd%s",
-		    (intmax_t)fsbtodb(&sblock, cgsblock(&sblock, cylno)),
-		    cylno < (sblock.fs_ncg - 1) ? "," : "" );
-		if (i + j >= width) {
-			printf("\n");
-			i = 0;
-		}
-		i += j;
-		printf("%s", tmpbuf);
-		fflush(stdout);
-	}
-	printf("\n");
 
 	/*
 	 * Do all needed changes in the first cylinder group.
@@ -1379,9 +1391,11 @@ main(int argc, char **argv)
 	struct fs *fs;
 	const char *device;
 	const struct statfs *statfsp;
+	struct stat stat_fs, stat_stdout, stat_stderr;
 	uint64_t size = 0;
 	off_t mediasize;
 	int error, j, fsi, fso, ch, ret, Nflag = 0, yflag = 0;
+	const struct fsid *suspfs = NULL;
 	char *p, reply[5], oldsizebuf[6], newsizebuf[6];
 	void *testbuf;
 
@@ -1585,9 +1599,7 @@ main(int argc, char **argv)
 			fso = open(_PATH_UFSSUSPEND, O_RDWR);
 			if (fso == -1)
 				err(1, "unable to open %s", _PATH_UFSSUSPEND);
-			error = ioctl(fso, UFSSUSPEND, &statfsp->f_fsid);
-			if (error != 0)
-				err(1, "UFSSUSPEND");
+			suspfs = &statfsp->f_fsid;
 		} else {
 			fso = open(device, O_WRONLY);
 			if (fso < 0)
@@ -1603,8 +1615,10 @@ main(int argc, char **argv)
 		err(1, "malloc");
 	rdfs((ufs2_daddr_t)((size - sblock.fs_fsize) / DEV_BSIZE),
 	    sblock.fs_fsize, testbuf, fsi);
+	ufssuspend(fso, suspfs, "last block");
 	wtfs((ufs2_daddr_t)((size - sblock.fs_fsize) / DEV_BSIZE),
 	    sblock.fs_fsize, testbuf, fso, Nflag);
+	ufsresume(fso, suspfs, "last block");
 	free(testbuf);
 
 	/*
@@ -1662,15 +1676,11 @@ main(int argc, char **argv)
 	/*
 	 * Ok, everything prepared, so now let's do the tricks.
 	 */
-	growfs(fsi, fso, Nflag);
+	growfs(fsi, fso, Nflag, suspfs);
 
 	close(fsi);
 	if (fso > -1) {
-		if (statfsp != NULL && (statfsp->f_flags & MNT_RDONLY) == 0) {
-			error = ioctl(fso, UFSRESUME);
-			if (error != 0)
-				err(1, "UFSRESUME");
-		}
+		ufsresume(fso, suspfs, "close");
 		error = close(fso);
 		if (error != 0)
 			err(1, "close");
@@ -1776,4 +1786,23 @@ cgckhash(struct cg *cgp)
 		return;
 	cgp->cg_ckhash = 0;
 	cgp->cg_ckhash = calculate_crc32c(~0L, (void *)cgp, sblock.fs_cgsize);
+}
+
+static void
+ufssuspend(int fd, const fsid_t *fsid, const char *errmsg)
+{
+	if (fsid == NULL)
+		return;
+	if (ioctl(fd, UFSSUSPEND, fsid) != 0)
+		err(1, "UFSSUSPEND %s", errmsg);
+}
+
+static void
+ufsresume(int fd, const fsid_t *fsid, const char *errmsg)
+
+{
+	if (fsid == NULL)
+		return;
+	if (ioctl(fd, UFSRESUME) != 0)
+		err(1, "UFSRESUME %s", errmsg);
 }
