@@ -115,7 +115,8 @@ ffs_susp_rdwr(struct cdev *dev, struct uio *uio, int ioflag)
 	devvp = ump->um_devvp;
 	fs = ump->um_fs;
 
-	if (ffs_susp_suspended(mp) == 0) {
+	int suspended = ffs_susp_suspended(mp);
+	if (suspended == 0 && uio->uio_offset < fs->fs_size * fs->fs_fsize) {
 		sx_sunlock(&ffs_susp_lock);
 		return (ENXIO);
 	}
@@ -175,6 +176,9 @@ out:
 	return (error);
 }
 
+/*
+ * Mark the UFS as suspended, and block writes from VFS.
+ */
 static int
 ffs_susp_suspend(struct mount *mp)
 {
@@ -183,8 +187,6 @@ ffs_susp_suspend(struct mount *mp)
 
 	sx_assert(&ffs_susp_lock, SA_XLOCKED);
 
-	if (!ffs_own_mount(mp))
-		return (EINVAL);
 	if (ffs_susp_suspended(mp))
 		return (EBUSY);
 
@@ -216,6 +218,9 @@ ffs_susp_suspend(struct mount *mp)
 	return (0);
 }
 
+/*
+ * Clear the UFS/VFS suspended state and permit writes again.
+ */
 static void
 ffs_susp_unsuspend(struct mount *mp)
 {
@@ -240,27 +245,20 @@ ffs_susp_unsuspend(struct mount *mp)
 	UFS_LOCK(ump);
 	ump->um_flags &= ~UM_WRITESUSPENDED;
 	UFS_UNLOCK(ump);
-	vfs_unbusy(mp);
 }
 
+/*
+ * Exit UFS's internal suspended state and reload the filesystem.
+ */
 static void
-ffs_susp_dtor(void *data)
+ffs_susp_resume(struct mount *mp)
 {
 	struct fs *fs;
 	struct ufsmount *ump;
-	struct mount *mp;
 	int error;
 
-	sx_xlock(&ffs_susp_lock);
-
-	mp = (struct mount *)data;
 	ump = VFSTOUFS(mp);
 	fs = ump->um_fs;
-
-	if (ffs_susp_suspended(mp) == 0) {
-		sx_xunlock(&ffs_susp_lock);
-		return;
-	}
 
 	KASSERT((mp->mnt_kern_flag & MNTK_SUSPEND) != 0,
 	    ("MNTK_SUSPEND not set"));
@@ -270,6 +268,25 @@ ffs_susp_dtor(void *data)
 		panic("failed to unsuspend writes on %s", fs->fs_fsmnt);
 
 	ffs_susp_unsuspend(mp);
+}
+
+/*
+ * Unsuspend filesystem if needed, and release the ffssuspend mount lock.
+ */
+static void
+ffs_susp_dtor(void *data)
+{
+	struct mount *mp;
+
+	sx_xlock(&ffs_susp_lock);
+
+	mp = (struct mount *)data;
+
+	if (ffs_susp_suspended(mp) != 0) {
+		ffs_susp_resume(mp);
+		vfs_unbusy(mp);
+	}
+
 	sx_xunlock(&ffs_susp_lock);
 }
 
@@ -279,8 +296,11 @@ ffs_susp_ioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags,
 {
 	struct mount *mp;
 	fsid_t *fsidp;
+	void *cdpcheck;
+	int hadcdp;
 	int error;
 
+	mp = NULL;
 	/*
 	 * No suspend inside the jail.  Allowing it would require making
 	 * sure that e.g. the devfs ruleset for that jail permits access
@@ -293,37 +313,63 @@ ffs_susp_ioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags,
 
 	switch (cmd) {
 	case UFSSUSPEND:
+	case UFSEXTEND:
+		/*
+		 * If any fds are open for write on the suspended filesystem,
+		 * return error to prevent deadlock.
+		 * Require single-thread curproc so that the check is not racey.
+		 * XXXKIB: might consider to singlethread curproc instead.
+		 * XXX: This does not prevent a process from attempting to open
+		 * such a file after calling this ioctl.
+		 */
+		error = curproc->p_numthreads > 1 ? EDEADLK :
+		    descrip_check_write_mp(curproc->p_fd, mp);
+		if (error != 0) {
+			break;
+		}
+
 		fsidp = (fsid_t *)addr;
+		/* Find and reference FS. */
 		mp = vfs_getvfs(fsidp);
 		if (mp == NULL) {
 			error = ENOENT;
 			break;
 		}
-		error = vfs_busy(mp, 0);
-		vfs_rel(mp);
-		if (error != 0)
+		/* Verify that it's FFS. */
+		if (!ffs_own_mount(mp)) {
+			error = EINVAL;
+			break;
+		}
+		/* If already in the desired state, nothing to do. */
+		hadcdp = devfs_get_cdevpriv(&cdpcheck) == 0;
+		if (hadcdp && !((cmd == UFSSUSPEND) ^ ffs_susp_suspended(mp)))
 			break;
 
 		/*
-		 * Require single-thread curproc so that the check is not racey.
-		 * XXXKIB: might consider to singlethread curproc instead.
+		 * If we don't have a cdevpriv already, get one and
+		 * mark the vfs mount busy.
 		 */
-		error = curproc->p_numthreads > 1 ? EDEADLK :
-		    descrip_check_write_mp(curproc->p_fd, mp);
-		if (error != 0)
-			break;
-
-		error = ffs_susp_suspend(mp);
-		if (error != 0) {
-			vfs_unbusy(mp);
-			break;
+		if (!hadcdp) {
+			error = devfs_set_cdevpriv(mp, ffs_susp_dtor);
+			if (error != 0)
+				break;
+			error = vfs_busy(mp, 0);
+			if (error != 0)
+				break;
 		}
-		error = devfs_set_cdevpriv(mp, ffs_susp_dtor);
-		if (error != 0)
-			ffs_susp_unsuspend(mp);
+		/*
+		 * Finally, suspend or resume-if-neeeded the filesystem.  An error here
+		 * does not release the mount lock.
+		 */
+		if (cmd == UFSSUSPEND) {
+			error = ffs_susp_suspend(mp);
+		} else if (hadcdp) {
+			ffs_susp_resume(mp);
+			error = 0;
+		}
 		break;
 	case UFSRESUME:
-		error = devfs_get_cdevpriv((void **)&mp);
+		error = devfs_get_cdevpriv(&cdpcheck);
 		if (error != 0)
 			break;
 		/*
@@ -339,6 +385,9 @@ ffs_susp_ioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags,
 		error = ENXIO;
 		break;
 	}
+
+	if (mp != NULL)
+		vfs_rel(mp);
 
 	sx_xunlock(&ffs_susp_lock);
 

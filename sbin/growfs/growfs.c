@@ -85,6 +85,10 @@ __FBSDID("$FreeBSD$");
 
 #include "debug.h"
 
+#ifndef UFSEXTEND
+#define        UFSEXTEND       _IOW('U', 3, fsid_t)
+#endif
+
 #ifdef FS_DEBUG
 int	_dbg_lvl_ = (DL_INFO);	/* DL_TRC */
 #endif /* FS_DEBUG */
@@ -105,7 +109,7 @@ static union {
 
 static struct csum	*fscs;	/* cylinder summary */
 
-static void	growfs(int, int, unsigned int, const fsid_t *);
+static void	growfs(int, int, unsigned int, const fsid_t *, int);
 static void	rdfs(ufs2_daddr_t, size_t, void *, int);
 static void	wtfs(ufs2_daddr_t, size_t, void *, int, unsigned int);
 static int	charsperline(void);
@@ -135,7 +139,7 @@ static void	ufsresume(int fd, const fsid_t *fsid, const char *errmsg);
  * copies.
  */
 static void
-growfs(int fsi, int fso, unsigned int Nflag, const fsid_t *suspfs)
+growfs(int fsi, int fso, unsigned int Nflag, const fsid_t *suspfs, int suspendlater)
 {
 	DBG_FUNC("growfs")
 	time_t modtime;
@@ -178,9 +182,6 @@ growfs(int fsi, int fso, unsigned int Nflag, const fsid_t *suspfs)
 	/*
 	 * Now build the cylinders group blocks and
 	 * then print out indices of cylinder groups.
-	 *
-	 * Since this does not write within the existing filesystem,
-	 * it could be done without suspending UFS.
 	 */
 	printf("super-block backups (for fsck_ffs -b #) at:\n");
 	i = 0;
@@ -190,9 +191,11 @@ growfs(int fsi, int fso, unsigned int Nflag, const fsid_t *suspfs)
 	 * Iterate for only the new cylinder groups.
 	 */
 	for (cylno = osblock.fs_ncg; cylno < sblock.fs_ncg; cylno++) {
-		ufssuspend(fso, suspfs, "cg");
+		if (!suspendlater)
+			ufssuspend(fso, suspfs, "cg");
 		initcg(cylno, modtime, fso, Nflag);
-		ufsresume(fso, suspfs, "cg");
+		if (!suspendlater)
+			ufsresume(fso, suspfs, "cg");
 		j = sprintf(tmpbuf, " %jd%s",
 		    (intmax_t)fsbtodb(&sblock, cgsblock(&sblock, cylno)),
 		    cylno < (sblock.fs_ncg - 1) ? "," : "" );
@@ -1396,6 +1399,7 @@ main(int argc, char **argv)
 	off_t mediasize;
 	int error, j, fsi, fso, ch, ret, Nflag = 0, yflag = 0;
 	const struct fsid *suspfs = NULL;
+	int suspendlater = 0;
 	char *p, reply[5], oldsizebuf[6], newsizebuf[6];
 	void *testbuf;
 
@@ -1608,6 +1612,20 @@ main(int argc, char **argv)
 	}
 
 	/*
+	 * We are about to read/write the volume's last block.  If
+	 * using /dev/ufssuspend, try the newer UFSEXTEND ioctl first,
+	 * then fall back to UFSSUSPEND.
+	 */
+	if (suspfs != NULL) {
+		if (ioctl(fso, UFSEXTEND, suspfs) < 0) {
+			if (errno != ENXIO)
+				err(1, "last block, unexpected error with ioctl UFSEXTEND");
+			ufssuspend(fso, suspfs, "last block");
+		} else
+			suspendlater = 1;
+	}
+
+	/*
 	 * Try to access our new last block in the file system.
 	 */
 	testbuf = malloc(sblock.fs_fsize);
@@ -1615,11 +1633,12 @@ main(int argc, char **argv)
 		err(1, "malloc");
 	rdfs((ufs2_daddr_t)((size - sblock.fs_fsize) / DEV_BSIZE),
 	    sblock.fs_fsize, testbuf, fsi);
-	ufssuspend(fso, suspfs, "last block");
 	wtfs((ufs2_daddr_t)((size - sblock.fs_fsize) / DEV_BSIZE),
 	    sblock.fs_fsize, testbuf, fso, Nflag);
-	ufsresume(fso, suspfs, "last block");
 	free(testbuf);
+
+	if (!suspendlater)
+		ufsresume(fso, suspfs, "last block");
 
 	/*
 	 * Now calculate new superblock values and check for reasonable
@@ -1676,7 +1695,7 @@ main(int argc, char **argv)
 	/*
 	 * Ok, everything prepared, so now let's do the tricks.
 	 */
-	growfs(fsi, fso, Nflag, suspfs);
+	growfs(fsi, fso, Nflag, suspfs, suspendlater);
 
 	close(fsi);
 	if (fso > -1) {
@@ -1788,6 +1807,9 @@ cgckhash(struct cg *cgp)
 	cgp->cg_ckhash = calculate_crc32c(~0L, (void *)cgp, sblock.fs_cgsize);
 }
 
+/*
+ * Manipulate the ufssuspend device state.
+ */
 static void
 ufssuspend(int fd, const fsid_t *fsid, const char *errmsg)
 {

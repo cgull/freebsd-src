@@ -901,5 +901,6 @@ extern u_char *fragtbl[];
  */
 #define	UFSSUSPEND	_IOW('U', 1, fsid_t)
 #define	UFSRESUME	_IO('U', 2)
+#define	UFSEXTEND	_IOW('U', 3, fsid_t)
 
 #endif
