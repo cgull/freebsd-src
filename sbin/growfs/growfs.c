@@ -1574,6 +1574,14 @@ main(int argc, char **argv)
 		fso = -1;
 	} else {
 		if (statfsp != NULL && (statfsp->f_flags & MNT_RDONLY) == 0) {
+			if (stat(statfsp->f_mntonname, &stat_fs) == -1)
+				err(1, "unable to stat %s", statfsp->f_mntonname);
+			if (fstat(STDOUT_FILENO, &stat_stdout) == -1)
+				err(1, "unable to fstat stdout");
+			if (fstat(STDERR_FILENO, &stat_stderr) == -1)
+				err(1, "unable to fstat stderr");
+			if (stat_fs.st_dev == stat_stdout.st_dev || stat_fs.st_dev == stat_stderr.st_dev)
+				errx(1, "stdout and stderr may not write to filesystem being grown");
 			fso = open(_PATH_UFSSUSPEND, O_RDWR);
 			if (fso == -1)
 				err(1, "unable to open %s", _PATH_UFSSUSPEND);
