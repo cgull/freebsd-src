@@ -292,7 +292,8 @@ usage(void)
 	    " [-P policy]"
 #endif
 	    " [-S sourceaddr] [-s packetsize] [-t timeout]\n"
-	    "\t    [-W waittime] [-z tclass] [IPv6-hops ...] IPv6-host\n"
+	    "\t    [-W waittime] [-w window ] [-z tclass] [IPv6-hops ...]\n"
+	    "\t    IPv6-host\n"
 #endif	/* INET6 */
 	    );
 

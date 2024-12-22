@@ -334,6 +334,15 @@ that are received are listed.
 Time in milliseconds to wait for a reply for each packet sent.
 If a reply arrives later, the packet is not printed as replied, but
 considered as replied when calculating statistics.
+.It Fl w Ar windowsize
+Windowing ping.  This option keeps multiple pings in transit by only
+waiting to transmit when no reply for a packet whose sequence number
+is less than or equal to
+.Ar windowsize 
+below the last transmitted packet's number has been received.  This
+option can be used to generate asynchronous traffic and to consume
+available bandwidth on a link.  Only the super-user may use this
+option.
 .El
 .Ss Options only for IPv4 targets
 .Bl -tag -width indent
@@ -428,15 +437,6 @@ that has no route through it
 .It Fl T Ar ttl
 Set the IP Time To Live for multicasted packets.
 This flag only applies if the ping destination is a multicast address.
-.It Fl w Ar windowsize
-Windowing ping.  This option keeps multiple pings in transit by only
-waiting to transmit when no reply for a packet whose sequence number
-is less than or equal to
-.Ar windowsize 
-below the last transmitted packet's number has been received.  This
-option can be used to generate asynchronous traffic and to consume
-available bandwidth on a link.  Only the super-user may use this
-option.
 .It Fl z Ar tos
 Use the specified type of service.
 .It Ar IPv4-host

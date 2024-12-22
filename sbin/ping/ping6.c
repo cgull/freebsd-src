@@ -97,6 +97,7 @@
 #include <net/route.h>
 
 #include <netinet/in.h>
+#include <netinet/in_systm.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <arpa/inet.h>
@@ -128,6 +129,7 @@
 
 #include "main.h"
 #include "ping6.h"
+#include "utils.h"
 
 struct tv32 {
 	u_int32_t tv32_sec;
@@ -225,6 +227,8 @@ static cap_channel_t *capdns;
 static long nmissedmax;		/* max value of ntransmitted - nreceived - 1 */
 static long npackets;		/* max packets to transmit */
 static long ntransmitfailures;	/* number of transmit failures */
+static n_short receivedseq;	/* highest sequence # seen on inbound packet */
+static n_short window;		/* window size in packets for streaming ping */
 static int interval = 1000;	/* interval between packets in ms */
 static int waittime = MAXWAIT;	/* timeout for each packet */
 
@@ -276,6 +280,7 @@ ping6(int argc, char *argv[])
 	int almost_done, ch, hold, packlen, preload, optval, error;
 	int nig_oldmcprefix = -1;
 	u_char *datap;
+	const char *errstr;
 	char *e, *target, *ifname = NULL, *gateway = NULL;
 	int ip6optlen = 0;
 	struct cmsghdr *scmsgp = NULL;
@@ -295,6 +300,7 @@ ping6(int argc, char *argv[])
 #endif
 	double t;
 	u_long alarmtimeout;
+	long long ltmp;
 	size_t rthlen;
 #ifdef IPV6_USE_MIN_MTU
 	int mflag = 0;
@@ -311,7 +317,7 @@ ping6(int argc, char *argv[])
 	intvl.tv_sec = interval / 1000;
 	intvl.tv_nsec = interval % 1000 * 1000000;
 
-	alarmtimeout = preload = 0;
+	alarmtimeout = preload = window = 0;
 	datap = &outpack[ICMP6ECHOLEN + ICMP6ECHOTMLEN];
 	capdns = capdns_setup();
 
@@ -572,6 +578,17 @@ ping6(int argc, char *argv[])
 			if (255 < tclass || tclass < -1)
 				errx(1,
 				    "illegal traffic class -- %s", optarg);
+			break;
+		case 'w':
+			ltmp = strtonum(optarg, 1, INT_MAX, &errstr);
+			if (errstr != NULL)
+				errx(EX_USAGE,
+				    "invalid window value: `%s'", optarg);
+                        window = (n_short)ltmp;
+			if (getuid()) {
+				errno = EPERM;
+				err(EX_NOPERM, "-w flag");
+			}
 			break;
 #ifdef IPSEC
 #ifdef IPSEC_POLICY_IPSEC
@@ -1159,6 +1176,16 @@ ping6(int argc, char *argv[])
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		timespecadd(&last, &intvl, &timeout);
 		timespecsub(&timeout, &now, &timeout);
+                /*
+                 * Don't wait to send if we've received any response
+                 * within our "window"
+                 */
+		if (!almost_done && window && 
+		    PING_SEQ_GEQ(receivedseq, (n_short)ntransmitted - window))
+		{
+			timeout.tv_nsec = 0;
+			timeout.tv_sec = 0;
+		}
 		if (timeout.tv_sec < 0)
 			timespecclear(&timeout);
 
@@ -1603,6 +1630,10 @@ pr_pack(u_char *buf, int cc, struct msghdr *mhdr)
 			SET(seq % mx_dup_ck);
 			dupflag = 0;
 		}
+
+		if (window && PING_SEQ_LT(seq, ntransmitted) &&
+                    PING_SEQ_GT(seq, receivedseq))
+                        receivedseq = seq;
 
 		if (options & F_QUIET)
 			return;
